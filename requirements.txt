@@ -107,6 +107,8 @@ watchdog==7.1.0
 websockets==17.4
 xxhash==4.1.0
 yarl==1.25.1
+langchain-postgres==0.0.19
+
 zstandard==0.25.0
 fastapi
 langchain-postgres
