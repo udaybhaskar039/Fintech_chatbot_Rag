@@ -10,7 +10,7 @@ from langchain_postgres import PGVector
 load_dotenv()
 
 COLLECTION_NAME = "finexa_policy_handbook_gemini_v2"
-EMBEDDING_DIMENSION = 768
+EMBEDDING_DIMENSION = 3072
 
 
 def get_database_url():
