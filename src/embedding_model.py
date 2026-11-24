@@ -15,7 +15,7 @@ def get_embedding_model():
     model = GoogleGenerativeAIEmbeddings(
         model="gemini-embedding-001",
         google_api_key=api_key,
-        output_dimensionality=768
+       output_dimensionality=3072
     )
 
     # Verify actual embedding dimensions
@@ -30,7 +30,7 @@ def get_embedding_model():
         actual_dimension
     )
 
-    if actual_dimension != 768:
+    if actual_dimension != 3072:
         raise ValueError(
             f"Embedding dimension mismatch! "
             f"Expected 768, got {actual_dimension}"
