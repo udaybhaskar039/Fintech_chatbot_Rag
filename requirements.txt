@@ -111,5 +111,5 @@ langchain-postgres==0.0.19
 
 zstandard==0.25.0
 fastapi
-langchain-postgres
 langchain-google-genai
+asyncpg
