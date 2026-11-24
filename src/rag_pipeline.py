@@ -1,12 +1,11 @@
 
-
 import re
+import json
 import uuid
 
 from langchain_groq import ChatGroq
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-
 from langchain_postgres import PGEngine, PGVectorStore
 
 from sqlalchemy import create_engine, text
@@ -29,7 +28,7 @@ FINAL_CONTEXT_DOCS = 4
 POLICY_DISTANCE_THRESHOLD = 2.5
 OPERATIONS_DISTANCE_THRESHOLD = 2.5
 
-# Gemini database configuration
+# Dedicated Gemini database storage
 SCHEMA_NAME = "finexa_gemini"
 TABLE_NAME = "finexa_policy_embeddings"
 EMBEDDING_DIMENSION = 3072
@@ -53,9 +52,9 @@ POLICY_HEADING_PATTERN = re.compile(
 # 3. EXTRACT POLICY ID
 # =========================================
 
-def extract_policy_id(text):
+def extract_policy_id(content):
 
-    match = POLICY_ID_PATTERN.search(text)
+    match = POLICY_ID_PATTERN.search(content)
 
     if match:
         return match.group(0).upper()
@@ -110,10 +109,12 @@ def split_policy_documents(documents):
             policy_id = extract_policy_id(section_text)
 
             if not policy_id:
+
                 print(
                     "WARNING: Policy ID not found:",
                     heading
                 )
+
                 continue
 
             useful_markers = [
@@ -133,10 +134,12 @@ def split_policy_documents(documents):
                 marker in section_text.lower()
                 for marker in useful_markers
             ):
+
                 print(
                     "Skipping metadata-only section:",
                     policy_id
                 )
+
                 continue
 
             metadata = dict(page_metadata)
@@ -182,11 +185,11 @@ STOPWORDS = {
 }
 
 
-def tokenize(text):
+def tokenize(content):
 
     words = re.findall(
         r"\b[a-z0-9]+\b",
-        text.lower()
+        content.lower()
     )
 
     return {
@@ -216,7 +219,7 @@ def calculate_keyword_score(question, document):
 
     score = len(matched_terms) / len(query_terms)
 
-    # POS duplicate debit matching
+    # POS matching
 
     is_pos_question = bool(
         re.search(
@@ -344,6 +347,7 @@ def retrieve_relevant_documents(
             print("Status: ACCEPTED")
 
         else:
+
             print("Status: REJECTED")
 
     candidates.sort(
@@ -378,8 +382,27 @@ def retrieve_relevant_documents(
 
 
 # =========================================
-# 8. DATABASE URL FOR PGENGINE
+# 8. DATABASE CONNECTION URLS
 # =========================================
+
+def get_sync_database_url():
+
+    database_url = make_url(get_database_url())
+
+    # Use Psycopg 3 for synchronous SQLAlchemy
+    if database_url.drivername in [
+        "postgresql",
+        "postgres",
+        "postgresql+psycopg2",
+        "postgresql+asyncpg"
+    ]:
+
+        database_url = database_url.set(
+            drivername="postgresql+psycopg"
+        )
+
+    return database_url
+
 
 def get_async_database_url():
 
@@ -387,7 +410,7 @@ def get_async_database_url():
 
     query_params = dict(database_url.query)
 
-    # Convert PostgreSQL URL to asyncpg URL
+    # Convert to asyncpg
     if database_url.drivername in [
         "postgresql",
         "postgres",
@@ -399,7 +422,7 @@ def get_async_database_url():
             drivername="postgresql+asyncpg"
         )
 
-    # asyncpg uses ssl rather than sslmode
+    # Convert sslmode to asyncpg ssl parameter
     sslmode = query_params.pop("sslmode", None)
 
     if sslmode and "ssl" not in query_params:
@@ -415,7 +438,30 @@ def get_async_database_url():
 
 
 # =========================================
-# 9. INITIALIZE GEMINI PGVECTOR STORE
+# 9. GENERATE STABLE DOCUMENT IDS
+# =========================================
+
+def generate_document_id(document):
+
+    document_data = (
+        document.page_content
+        + json.dumps(
+            document.metadata or {},
+            sort_keys=True,
+            default=str
+        )
+    )
+
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            document_data
+        )
+    )
+
+
+# =========================================
+# 10. INITIALIZE GEMINI PGVECTOR STORE
 # =========================================
 
 def initialize_gemini_vector_store(
@@ -423,14 +469,28 @@ def initialize_gemini_vector_store(
     embedding_model
 ):
 
-    database_url = get_database_url()
+    if not documents:
 
-    # Create schema using existing PostgreSQL connection
-    sql_engine = create_engine(database_url)
+        raise ValueError(
+            "No policy documents available for indexing."
+        )
+
+    print("\nConnecting to Supabase...")
+
+    # -------------------------------------
+    # A. Create/check dedicated schema
+    # -------------------------------------
+
+    sync_engine = create_engine(
+        get_sync_database_url()
+    )
+
+    table_exists = False
+    existing_ids = set()
 
     try:
 
-        with sql_engine.begin() as connection:
+        with sync_engine.begin() as connection:
 
             connection.execute(
                 text(
@@ -439,16 +499,14 @@ def initialize_gemini_vector_store(
             )
 
             table_exists = connection.execute(
-                text("""
-                    SELECT to_regclass(
-                        :table_name
-                    )
-                """),
+                text(
+                    "SELECT to_regclass(:table_name)"
+                ),
                 {
                     "table_name":
                     f"{SCHEMA_NAME}.{TABLE_NAME}"
                 }
-            ).scalar()
+            ).scalar() is not None
 
             if table_exists:
 
@@ -469,37 +527,57 @@ def initialize_gemini_vector_store(
                     }
                 ).scalar()
 
-                print("Existing Gemini table dimension:", dimension)
+                print(
+                    "Existing Gemini embedding dimension:",
+                    dimension
+                )
 
-                if dimension != "vector(3072)":
+                if dimension != f"vector({EMBEDDING_DIMENSION})":
+
                     raise ValueError(
-                        "Gemini table has an incorrect dimension. "
-                        f"Expected vector(3072), got {dimension}"
+                        "Incorrect Gemini vector dimension. "
+                        f"Expected vector({EMBEDDING_DIMENSION}), "
+                        f"got {dimension}"
                     )
 
-                indexed_count = connection.execute(
+                rows = connection.execute(
                     text(
-                        f'SELECT COUNT(*) FROM '
+                        f'SELECT langchain_id FROM '
                         f'"{SCHEMA_NAME}"."{TABLE_NAME}"'
                     )
-                ).scalar()
+                ).fetchall()
 
-            else:
-                indexed_count = 0
+                existing_ids = {
+                    str(row[0])
+                    for row in rows
+                }
+
+                print(
+                    "Existing indexed documents:",
+                    len(existing_ids)
+                )
 
     finally:
 
-        sql_engine.dispose()
+        sync_engine.dispose()
 
-    # Create separate PGEngine
+    # -------------------------------------
+    # B. Create PGEngine
+    # -------------------------------------
+
+    print("\nInitializing Gemini PGEngine...")
+
     pg_engine = PGEngine.from_connection_string(
         url=get_async_database_url()
     )
 
-    # Create a new table only if it does not exist
+    # -------------------------------------
+    # C. Create separate vector table
+    # -------------------------------------
+
     if not table_exists:
 
-        print("\nCreating separate Gemini vector table...")
+        print("\nCreating dedicated Gemini table...")
 
         pg_engine.init_vectorstore_table(
             table_name=TABLE_NAME,
@@ -512,9 +590,14 @@ def initialize_gemini_vector_store(
             overwrite_existing=False
         )
 
-        print("Gemini vector table created successfully.")
+        print(
+            "Gemini vector table created successfully."
+        )
 
-    # Connect to the dedicated Gemini table
+    # -------------------------------------
+    # D. Connect PGVectorStore
+    # -------------------------------------
+
     vector_store = PGVectorStore.create_sync(
         engine=pg_engine,
         embedding_service=embedding_model,
@@ -526,59 +609,73 @@ def initialize_gemini_vector_store(
         id_column="langchain_id"
     )
 
-    if indexed_count == 0:
+    # -------------------------------------
+    # E. Add only missing documents
+    # -------------------------------------
 
-        print("\nNo indexed Gemini documents found.")
-        print("Creating Gemini embeddings...")
+    missing_documents = []
+    missing_ids = []
 
-        ids = []
+    for document in documents:
 
-        for index, document in enumerate(documents):
+        document_id = generate_document_id(document)
 
-            document_data = (
-                str(index)
-                + document.page_content
-                + str(document.metadata)
-            )
+        if document_id not in existing_ids:
 
-            document_id = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    document_data
-                )
-            )
+            missing_documents.append(document)
+            missing_ids.append(document_id)
 
-            ids.append(document_id)
+    if missing_documents:
+
+        print(
+            "\nNew documents to index:",
+            len(missing_documents)
+        )
 
         vector_store.add_documents(
-            documents=documents,
-            ids=ids
+            documents=missing_documents,
+            ids=missing_ids
         )
 
         print(
-            "Total Gemini documents indexed:",
-            len(documents)
+            "New Gemini documents indexed successfully."
         )
 
     else:
 
         print(
-            "\nExisting Gemini documents found:",
-            indexed_count
+            "\nAll policy documents are already indexed."
         )
 
-        print("Loading existing Gemini vector table.")
+    print(
+        "Total documents expected:",
+        len(documents)
+    )
+
+    print(
+        "Previously indexed documents:",
+        len(existing_ids)
+    )
+
+    print(
+        "New documents indexed:",
+        len(missing_documents)
+    )
 
     return vector_store
 
 
 # =========================================
-# 10. CREATE RAG PIPELINE
+# 11. CREATE RAG PIPELINE
 # =========================================
 
 def create_rag_pipeline():
 
     print("\nInitializing Finexa RAG...")
+
+    # -------------------------------------
+    # A. Load PDF documents
+    # -------------------------------------
 
     documents = load_documents()
 
@@ -588,7 +685,14 @@ def create_rag_pipeline():
             "No PDF documents found in data/raw."
         )
 
-    print("Loaded policy PDF documents:", len(documents))
+    print(
+        "Loaded policy PDF documents:",
+        len(documents)
+    )
+
+    # -------------------------------------
+    # B. Extract policy-specific documents
+    # -------------------------------------
 
     policy_documents = split_policy_documents(
         documents
@@ -601,12 +705,18 @@ def create_rag_pipeline():
             "Check PDF headings and policy IDs."
         )
 
-    # Load Gemini embedding model
+    # -------------------------------------
+    # C. Initialize Gemini embeddings
+    # -------------------------------------
+
     print("\nLoading Gemini embedding model...")
 
     embedding_model = get_embedding_model()
 
-    # Initialize separate Gemini storage
+    # -------------------------------------
+    # D. Initialize Supabase PGVector
+    # -------------------------------------
+
     print("\nConnecting to Gemini PGVector storage...")
 
     vector_store = initialize_gemini_vector_store(
@@ -614,20 +724,24 @@ def create_rag_pipeline():
         embedding_model
     )
 
-    print("\nGemini PGVector initialized successfully.")
+    print(
+        "\nGemini PGVector initialized successfully."
+    )
 
-    # =====================================
-    # 11. GROQ LLM
-    # =====================================
+    # -------------------------------------
+    # E. Initialize Groq LLM
+    # -------------------------------------
+
+    print("\nInitializing Groq LLM...")
 
     llm = ChatGroq(
         model="openai/gpt-oss-20b",
         temperature=0
     )
 
-    # =====================================
-    # 12. STRICT RAG PROMPT
-    # =====================================
+    # -------------------------------------
+    # F. Strict RAG prompt
+    # -------------------------------------
 
     prompt = ChatPromptTemplate.from_template("""
 You are Finexa, a Financial Operations Assistant.
@@ -662,10 +776,20 @@ ANSWER:
 """)
 
     # =====================================
-    # 13. ASK QUESTION
+    # 12. ASK QUESTION
     # =====================================
 
     def ask_question(question):
+
+        if not isinstance(question, str) or not question.strip():
+
+            return "Please enter a valid question."
+
+        question = question.strip()
+
+        # ---------------------------------
+        # A. Detect intent
+        # ---------------------------------
 
         intent = classify_intent(question)
 
@@ -687,6 +811,10 @@ ANSWER:
                 "Your question is outside my supported domain."
             )
 
+        # ---------------------------------
+        # B. Select retrieval settings
+        # ---------------------------------
+
         if intent == "policy":
 
             print(
@@ -707,7 +835,13 @@ ANSWER:
 
         else:
 
-            return "Unable to identify the financial intent."
+            return (
+                "Unable to identify the financial intent."
+            )
+
+        # ---------------------------------
+        # C. Retrieve relevant documents
+        # ---------------------------------
 
         relevant_docs = retrieve_relevant_documents(
             vector_store,
@@ -723,6 +857,10 @@ ANSWER:
                 "information in the financial policy "
                 "documents to answer your question."
             )
+
+        # ---------------------------------
+        # D. Build context
+        # ---------------------------------
 
         context_parts = []
 
@@ -763,6 +901,10 @@ POLICY CONTENT:
 
         context = "\n\n".join(context_parts)
 
+        # ---------------------------------
+        # E. Generate Groq response
+        # ---------------------------------
+
         messages = prompt.format_messages(
             context=context,
             question=question
@@ -775,4 +917,3 @@ POLICY CONTENT:
     print("\nFinexa RAG initialized successfully.")
 
     return ask_question
-
