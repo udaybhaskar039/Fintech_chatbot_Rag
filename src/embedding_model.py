@@ -1,24 +1,24 @@
 
 
+
 import os
 
-from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 
 def get_embedding_model():
 
-    hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    api_key = os.getenv("GOOGLE_API_KEY")
 
-    if not hf_token:
+    if not api_key:
         raise ValueError(
-            "HUGGINGFACEHUB_API_TOKEN not found."
+            "GOOGLE_API_KEY not found in environment variables."
         )
 
-    model = HuggingFaceEndpointEmbeddings(
-        model="sentence-transformers/all-MiniLM-L6-v2",
-        task="feature-extraction",
-        huggingfacehub_api_token=hf_token
+    model = GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+        google_api_key=api_key,
+        output_dimensionality=384
     )
 
     return model
-
