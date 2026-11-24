@@ -113,3 +113,5 @@ zstandard==0.25.0
 fastapi
 langchain-google-genai
 asyncpg
+psycopg[binary]
+
